@@ -1,0 +1,70 @@
+body {
+    text-align: center;
+    font-family: Arial, sans-serif;
+    background-color: #333;
+    color: white;
+}
+
+#game-board {
+    width: 800px;
+    height: 300px;
+    border: 3px solid #FFF;
+    margin: 20px auto;
+    position: relative;
+    overflow: hidden; /* Essencial para os obstáculos saírem da tela */
+    background-color: #555;
+}
+
+#player {
+    width: 40px;
+    height: 40px;
+    background-color: #4CAF50; /* Verde zumbi */
+    position: absolute;
+    bottom: 0;
+    left: 50px;
+}
+
+.player-jump {
+    animation: jump 0.6s linear;
+}
+
+@keyframes jump {
+    0% { bottom: 0; }
+    50% { bottom: 120px; }
+    100% { bottom: 0; }
+}
+
+.obstacle {
+    width: 30px;
+    height: 60px;
+    background-color: #f44336; /* Vermelho obstáculo */
+    position: absolute;
+    bottom: 0;
+    right: -30px; /* Começa fora da tela */
+    animation: move-obstacle 3s linear infinite;
+}
+
+@keyframes move-obstacle {
+    0% { right: -30px; }
+    100% { right: 800px; }
+}
+
+#game-over-screen {
+    display: none; /* Começa escondido */
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.7);
+    justify-content: center;
+    align-items: center;
+}
+
+#game-over-box {
+    background-color: #FFF;
+    color: #000;
+    padding: 30px;
+    border-radius: 10px;
+    text-align: center;
+}

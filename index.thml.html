@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zombie Run</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <h1>Zombie Run</h1>
+    <p>Pressione a Barra de Espaço para pular!</p>
+    <div id="game-board">
+        <div id="player"></div>
+    </div>
+    <div id="game-over-screen">
+        <div id="game-over-box">
+            <h2>Fim de Jogo!</h2>
+            <p>Sua pontuação: <span id="score">0</span></p>
+            <button onclick="location.reload()">Jogar Novamente</button>
+        </div>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
