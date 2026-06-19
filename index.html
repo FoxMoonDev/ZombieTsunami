@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>🧟 Zombie Tsunami</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ════════════════════════════════════════
+     TELA DE INÍCIO
+════════════════════════════════════════ -->
+<div id="screen-start" class="screen active">
+  <div class="screen-box">
+    <div class="logo">
+      <div class="logo-emoji">🧟</div>
+      <h1>ZOMBIE<br><span>TSUNAMI</span></h1>
+      <p class="tagline">A horda está chegando. Cresça ou morra.</p>
+    </div>
+    <div class="hint-list">
+      <div class="hint"><span class="key">ESPAÇO / CLIQUE</span> Pular (segure = pulo alto)</div>
+      <div class="hint"><span class="key">P / ESC</span> Pausar</div>
+      <div class="hint touch-only">📱 Toque curto = pulo baixo · Segure = pulo alto</div>
+    </div>
+    <button class="btn-green" id="btn-start">▶ INICIAR JOGO</button>
+    <div class="best-wrap">Recorde: <span id="start-best">0</span> pts · Moedas: <span id="start-coins">0</span></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════
+     SHOP
+════════════════════════════════════════ -->
+<div id="screen-shop" class="screen">
+  <div class="screen-box shop-box">
+    <h2>🛒 LOJA</h2>
+    <div class="coins-display">💰 <span id="shop-coins">0</span> moedas</div>
+    <div class="shop-grid" id="shop-grid"></div>
+    <button class="btn-outline" id="btn-shop-close">✖ FECHAR</button>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════
+     PAUSA
+════════════════════════════════════════ -->
+<div id="screen-pause" class="screen">
+  <div class="screen-box">
+    <h2>⏸ PAUSADO</h2>
+    <button class="btn-green"   id="btn-resume">▶ CONTINUAR</button>
+    <button class="btn-outline" id="btn-shop-pause">🛒 LOJA</button>
+    <button class="btn-outline" id="btn-restart-pause">↺ REINICIAR</button>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════
+     GAME OVER
+════════════════════════════════════════ -->
+<div id="screen-gameover" class="screen">
+  <div class="screen-box">
+    <div class="go-skull">💀</div>
+    <h2>FIM DE JOGO</h2>
+    <div class="result-grid">
+      <div class="result-row"><span>Distância</span><strong id="go-score">0</strong></div>
+      <div class="result-row"><span>Zumbis comidos</span><strong id="go-eaten">0</strong></div>
+      <div class="result-row"><span>Cérebros</span><strong id="go-brains">🧠 0</strong></div>
+      <div class="result-row"><span>Moedas ganhas</span><strong id="go-coins">💰 0</strong></div>
+      <div class="result-row highlight"><span>Recorde</span><strong id="go-best">0</strong> <span id="go-new" class="new-badge hidden">NOVO!</span></div>
+    </div>
+    <button class="btn-green"   id="btn-restart">↺ JOGAR NOVAMENTE</button>
+    <button class="btn-outline" id="btn-shop-go">🛒 LOJA</button>
+    <button class="btn-outline" id="btn-menu">⌂ MENU</button>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════
+     HUD
+════════════════════════════════════════ -->
+<div id="hud">
+  <div class="hud-left">
+    <div class="hud-item">
+      <span class="lbl">HORDA</span>
+      <span id="h-horde" class="val val-green">1</span>
+    </div>
+    <div class="hud-item">
+      <span class="lbl">DIST</span>
+      <span id="h-score" class="val">0</span>
+    </div>
+  </div>
+  <div class="hud-center">
+    <div id="bonus-indicator" class="bonus-ind hidden"></div>
+  </div>
+  <div class="hud-right">
+    <div class="hud-item">
+      <span class="lbl">🧠</span>
+      <span id="h-brains" class="val val-red">0</span>
+    </div>
+    <div class="hud-item">
+      <span class="lbl">💰</span>
+      <span id="h-coins" class="val val-gold">0</span>
+    </div>
+    <button id="btn-pause-hud" title="Pausar (P)">⏸</button>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════
+     ÁREA DO JOGO
+════════════════════════════════════════ -->
+<div id="game-wrap">
+
+  <!-- Fundo / céu -->
+  <div id="sky">
+    <div id="moon"></div>
+    <div id="stars-layer"></div>
+    <div id="clouds-layer"></div>
+  </div>
+
+  <!-- Cidade paralax -->
+  <div id="city-layer"></div>
+
+  <!-- Chão -->
+  <div id="ground-layer">
+    <div id="ground-line"></div>
+    <div id="ground-body"></div>
+  </div>
+
+  <!-- Buracos (renderizados como ausências no chão) -->
+  <div id="holes-layer"></div>
+
+  <!-- Objetos do mundo: veículos parados, bombas, caixas, moedas, humanos -->
+  <div id="world-layer"></div>
+
+  <!-- Horda de zumbis -->
+  <div id="horde-layer"></div>
+
+  <!-- Partículas -->
+  <div id="fx-layer"></div>
+
+  <!-- Power-up ativo (visual grande) -->
+  <div id="bonus-layer"></div>
+
+</div>
+
+<!-- Toast de power-up -->
+<div id="toast" class="toast hidden"></div>
+
+<script src="script.js"></script>
+</body>
+</html>
