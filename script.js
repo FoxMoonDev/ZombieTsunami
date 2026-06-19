@@ -1,1223 +1,942 @@
 /**
- * ZOMBIE TSUNAMI — script.js
- * Fiel ao jogo original da Mobigame:
- * - Horda de zumbis (múltiplos personagens)
- * - Humanos → viram zumbis ao ser comidos
- * - Veículos parados (requerem X zumbis para virar)
- * - Veículos em movimento (matam 1 zumbi)
- * - Buracos no chão (zumbis caem e morrem)
- * - Bombas (no chão e no ar)
- * - Caixas misteriosas → 8 power-ups
- * - Moedas e cérebros
- * - Shop com upgrades permanentes
- * - Sistema de horda escalável
+ * ZOMBIE TSUNAMI — script.js v5 (reescrita limpa)
+ *
+ * ARQUITETURA:
+ * - Câmera: worldX avança. Objetos em "world space".
+ *   #holes e #world movem via CSS transform (GPU).
+ * - Física: valores fixos por frame (60fps base).
+ *   Movimento lateral usa dt para suavidade.
+ * - Colisão: AABB simples. Veículos só colidem se y<=2 (no chão).
+ * - Horda: array de zumbis. Todos pulam juntos.
+ *   Morte remove o último. Game over quando array vazia.
  */
 'use strict';
 
-/* ══════════════════════════════════════════════════
-   CONSTANTES
-══════════════════════════════════════════════════ */
-const C = {
-  GRAVITY:        0.6,
-  JUMP_FORCE:    -13,
-  JUMP_HOLD:      0.45,   // multiplicador do hold
-  PLAYER_X_BASE:  60,     // X do primeiro zumbi
-  ZOMBIE_SPACING: 28,     // espaço entre zumbis da horda
-  GROUND_H:       0.18,   // % do viewport height
-  SPEED_BASE:     4.5,
-  SPEED_MAX:      11,
-  SPEED_INC:      0.001,
-  SCORE_PER_FRAME:0.06,
+/* ════════════════════════════════════════════════
+   CONSTANTES — nunca mudam durante o jogo
+════════════════════════════════════════════════ */
+const CFG = {
+  /* física */
+  GRAVITY:    0.52,
+  JUMP_V:    -12,
+  HOLD_BOOST: 0.06,   // impulso extra enquanto segura
+  HOLD_MAX:   220,    // ms máximo de hold
 
-  // Veículos: [tipo, largura, altura, zombiesNecessários, recompensaHumanos]
-  VEHICLES: {
-    car:   { w:70,  h:36,  req:4,  humans:1, label:'4🧟' },
-    bus:   { w:100, h:46,  req:8,  humans:3, label:'8🧟' },
-    tank:  { w:90,  h:42,  req:12, humans:3, label:'12🧟' },
-    plane: { w:120, h:48,  req:16, humans:5, label:'16🧟' },
+  /* mundo */
+  PLAYER_X:   82,     // posição X do líder na tela
+  ZOMBIE_GAP: 26,     // espaço entre zumbis da fila
+  GROUND_PCT: 18,     // % de altura do chão
+
+  /* velocidade */
+  SPD_START:  4.0,
+  SPD_MAX:    10.0,
+  SPD_INC:    0.0007,
+
+  /* spawn */
+  SPAWN_FIRST: 1600,  // ms antes do primeiro objeto
+  SPAWN_MIN:   800,
+  SPAWN_MAX:   2200,
+
+  /* veículos parados: largura, req zombis, recompensa */
+  VEH: {
+    car:  { w:68,  req:4,  rew:1, label:'4🧟'  },
+    bus:  { w:96,  req:8,  rew:3, label:'8🧟'  },
+    tank: { w:88,  req:12, rew:3, label:'12🧟' },
+    plane:{ w:118, req:16, rew:5, label:'16🧟' },
   },
 
-  // Humanos NPC
-  HUMAN_TYPES: ['npc-m','npc-f','npc-soldier','npc-fat'],
+  HUMAN_T: ['npc-m','npc-f','npc-s','npc-fat'],
 
-  // Bonus (power-ups)
-  BONUSES: {
-    ninja:      { label:'NINJA',      color:'#00ff88', icon:'🥷', duration:8000  },
-    dragon:     { label:'DRAGÃO',     color:'#ff6600', icon:'🐉', duration:8000  },
-    giantz:     { label:'GIANT Z',    color:'#ff0044', icon:'👾', duration:8000  },
-    quarterback:{ label:'QUARTERBACK',color:'#ff8800', icon:'🏈', duration:8000  },
-    ufo:        { label:'UFO',        color:'#00ffff', icon:'🛸', duration:10000 },
-    gold:       { label:'GOLD',       color:'#f5a623', icon:'✨', duration:8000  },
-    balloon:    { label:'BALLOON',    color:'#ff66cc', icon:'🎈', duration:8000  },
-    tsunami:    { label:'TSUNAMI',    color:'#0066ff', icon:'🌊', duration:7000  },
+  BONUS: {
+    ninja:      { lbl:'NINJA',       color:'#00ff88', icon:'🥷', ms:8000  },
+    dragon:     { lbl:'DRAGÃO',      color:'#ff6600', icon:'🐉', ms:8000  },
+    giantz:     { lbl:'GIANT Z',     color:'#ff0044', icon:'👾', ms:8000  },
+    qb:         { lbl:'QUARTERBACK', color:'#ff8800', icon:'🏈', ms:8000  },
+    ufo:        { lbl:'UFO',         color:'#00ffff', icon:'🛸', ms:10000 },
+    gold:       { lbl:'GOLD',        color:'#f5a623', icon:'✨', ms:8000  },
+    balloon:    { lbl:'BALLOON',     color:'#ff66cc', icon:'🎈', ms:8000  },
+    tsunami:    { lbl:'TSUNAMI',     color:'#0066ff', icon:'🌊', ms:7000  },
   },
-
-  BONUS_KEYS: ['ninja','dragon','giantz','quarterback','ufo','gold','balloon','tsunami'],
 };
+const BONUS_KEYS = Object.keys(CFG.BONUS);
 
-/* ══════════════════════════════════════════════════
-   SAVE / PERSISTÊNCIA
-══════════════════════════════════════════════════ */
-function loadData() {
-  try { return JSON.parse(localStorage.getItem('zt_save') || 'null') || defaultSave(); }
-  catch { return defaultSave(); }
-}
-function defaultSave() {
-  return {
-    best: 0,
-    coins: 0,
-    upgrades: {
-      startZombies: 0,   // nível 0=1, 1=2, 2=3 zumbis iniciais
-      speed: 0,          // redução de velocidade inicial
-      bonusDuration: 0,  // +tempo nos bonuses
-      hordeMagnet: 0,    // atrai moedas/cérebros
-    }
-  };
-}
-function saveData() {
-  try { localStorage.setItem('zt_save', JSON.stringify(save)); } catch {}
+/* ════════════════════════════════════════════════
+   SAVE
+════════════════════════════════════════════════ */
+const SAVE_KEY = 'zt5';
+function mkSave(){ return { best:0, coins:0, upg:{ startZ:0, spd:0, bonMs:0 } }; }
+let S = (() => { try{ return JSON.parse(localStorage.getItem(SAVE_KEY)||'null')||mkSave(); }catch{ return mkSave(); } })();
+let _saveQ = false;
+function writeSave(){
+  if(_saveQ) return; _saveQ=true;
+  setTimeout(()=>{ try{localStorage.setItem(SAVE_KEY,JSON.stringify(S));}catch{} _saveQ=false; },300);
 }
 
-let save = loadData();
-
-/* ══════════════════════════════════════════════════
+/* ════════════════════════════════════════════════
    ESTADO DO JOGO
-══════════════════════════════════════════════════ */
+════════════════════════════════════════════════ */
 const G = {
-  running:    false,
-  paused:     false,
-  score:      0,
-  brains:     0,
-  coinsRun:   0,   // moedas desta run
-  eaten:      0,   // humanos comidos
-  speed:      C.SPEED_BASE,
+  on: false, paused: false,
 
-  // Horda
-  zombies:    [],  // array de {el, x, y, vy, onGround, jumpCount, dead}
-  hordeSize:  1,
+  /* mundo */
+  worldX: 0,       // câmera: quantos px o mundo avançou
+  speed: CFG.SPD_START,
+  score: 0,
 
-  // Física de pulo (compartilhada: todos pulam juntos)
-  jumping:    false,
-  holdTime:   0,
-  isHolding:  false,
+  /* horda */
+  horde: [],       // [{el, y, vy, onGround, jCount, dead}]
+  holding: false,
+  holdMs: 0,
 
-  // Bonus ativo
-  bonus:      null,    // string do tipo, ou null
-  bonusTimer: null,
-  ufoEl:      null,
-  ufoCloneTimer: null,
-  tsunamiEl:  null,
+  /* coleta */
+  coins: 0, brains: 0, eaten: 0,
 
-  // Objetos do mundo
-  worldObjs:  [],   // {el, x, w, type, data}
-  holes:      [],   // {el, x, w}
-  coins:      [],   // {el, x, y}
-  brainItems: [],
+  /* objetos do mundo */
+  objs: [],        // [{el, wx, w, type, extra}]
+  holes: [],       // [{el, wx, w}]
 
-  frameId:    null,
-  spawnTimer: null,
-  lastTs:     0,
+  /* bonus */
+  bonus: null,
+  bonusTid: null, ufoTid: null, giantTid: null,
+  ufoEl: null,
+
+  /* loop */
+  fid: null, spawnTid: null, lastTs: 0,
 };
 
-/* ══════════════════════════════════════════════════
+/* ════════════════════════════════════════════════
    DOM
-══════════════════════════════════════════════════ */
+════════════════════════════════════════════════ */
 const $ = id => document.getElementById(id);
-const D = {
-  screenStart:   $('screen-start'),
-  screenShop:    $('screen-shop'),
-  screenPause:   $('screen-pause'),
-  screenGameover:$('screen-gameover'),
-  hud:           $('hud'),
-  hHorde:        $('h-horde'),
-  hScore:        $('h-score'),
-  hBrains:       $('h-brains'),
-  hCoins:        $('h-coins'),
-  bonusInd:      $('bonus-indicator'),
-  worldLayer:    $('world-layer'),
-  holesLayer:    $('holes-layer'),
-  hordeLayer:    $('horde-layer'),
-  fxLayer:       $('fx-layer'),
-  bonusLayer:    $('bonus-layer'),
-  cityLayer:     $('city-layer'),
-  starsLayer:    $('stars-layer'),
-  cloudsLayer:   $('clouds-layer'),
-  toast:         $('toast'),
-  shopGrid:      $('shop-grid'),
+const EL = {
+  sStart: $('screen-start'), sPause: $('screen-pause'),
+  sGO:    $('screen-gameover'), sShop: $('screen-shop'),
+  hHorde: $('h-horde'), hScore: $('h-score'),
+  hBrains:$('h-brains'), hCoins: $('h-coins'),
+  bonusBar: $('bonus-bar'),
+  worldEl:  $('world'), holesEl: $('holes'),
+  hordeEl:  $('horde'), fxEl:    $('fx'),
+  bonVfx:   $('bonus-vfx'),
+  city: $('city'), stars: $('stars'), clouds: $('clouds'),
+  toast: $('toast'), shopGrid: $('shop-grid'),
 };
 
-/* ══════════════════════════════════════════════════
-   UTILIDADES
-══════════════════════════════════════════════════ */
-const rand    = (a,b)  => Math.random() * (b-a) + a;
-const randInt = (a,b)  => Math.floor(rand(a,b+1));
-const clamp   = (v,a,b)=> Math.min(Math.max(v,a),b);
-const groundPx = ()    => window.innerHeight * C.GROUND_H;
+/* ════════════════════════════════════════════════
+   UTILITÁRIOS
+════════════════════════════════════════════════ */
+const rnd  = (a,b)   => Math.random()*(b-a)+a;
+const rInt = (a,b)   => Math.floor(rnd(a,b+1));
+const clamp= (v,a,b) => v<a?a:v>b?b:v;
+const groundH = ()   => window.innerHeight * CFG.GROUND_PCT / 100;
 
-function showScreen(el) {
-  [D.screenStart, D.screenShop, D.screenPause, D.screenGameover]
-    .forEach(s => s.classList.remove('active'));
-  if (el) el.classList.add('active');
+// HUD — só escreve no DOM quando muda
+let _hH=-1,_hS=-1,_hB=-1,_hC=-1;
+function hudHorde(){
+  let n=0; for(let i=0;i<G.horde.length;i++) if(!G.horde[i].dead) n++;
+  if(n!==_hH){ EL.hHorde.textContent=n; _hH=n; }
+}
+function hudScore(){
+  const s=Math.floor(G.score);
+  if(s!==_hS){ EL.hScore.textContent=s; _hS=s; }
+}
+function hudBrains(){
+  if(G.brains!==_hB){ EL.hBrains.textContent=G.brains; _hB=G.brains; }
+}
+function hudCoins(){
+  if(S.coins!==_hC){ EL.hCoins.textContent=S.coins; _hC=S.coins; }
+}
+function hudAll(){ _hH=_hS=_hB=_hC=-1; hudHorde(); hudScore(); hudBrains(); hudCoins(); }
+
+function showScreen(el){
+  [EL.sStart,EL.sPause,EL.sGO,EL.sShop].forEach(s=>s.classList.remove('active'));
+  if(el) el.classList.add('active');
 }
 
-function showToast(text, color = '#fff', dur = 2000) {
-  D.toast.textContent = text;
-  D.toast.style.color = color;
-  D.toast.style.borderColor = color;
-  D.toast.classList.remove('hidden');
-  clearTimeout(D.toast._t);
-  D.toast._t = setTimeout(() => D.toast.classList.add('hidden'), dur);
+function toast(txt,color='#fff',ms=1100){
+  EL.toast.textContent=txt; EL.toast.style.color=color;
+  EL.toast.style.borderColor=color; EL.toast.classList.remove('hidden');
+  clearTimeout(EL.toast._t);
+  EL.toast._t=setTimeout(()=>EL.toast.classList.add('hidden'),ms);
 }
 
-function updateHUD() {
-  let aliveCount = 0;
-  for (let i = 0; i < G.zombies.length; i++) if (!G.zombies[i].dead) aliveCount++;
-  D.hHorde.textContent  = aliveCount;
-  D.hScore.textContent  = Math.floor(G.score);
-  D.hBrains.textContent = G.brains;
-  D.hCoins.textContent  = save.coins;
+/* ════════════════════════════════════════════════
+   CÂMERA
+════════════════════════════════════════════════ */
+let _camTx = '';
+function applyCamera(){
+  const tx=`translateX(${(-G.worldX+CFG.PLAYER_X).toFixed(1)}px)`;
+  if(tx===_camTx) return;
+  _camTx=tx;
+  EL.worldEl.style.transform=tx;
+  EL.holesEl.style.transform=tx;
 }
 
-/* ══════════════════════════════════════════════════
-   CENA: ESTRELAS, NUVENS, CIDADE
-══════════════════════════════════════════════════ */
-function buildScene() {
+/* ════════════════════════════════════════════════
+   CENA (estrelas, nuvens, prédios)
+════════════════════════════════════════════════ */
+let _blds=[];
+
+function buildScene(){
   // Estrelas
-  D.starsLayer.innerHTML = '';
-  for (let i = 0; i < 70; i++) {
-    const s = document.createElement('div');
-    s.className = 'star';
-    const sz = rand(1,3);
-    s.style.cssText = `left:${rand(0,100)}%;top:${rand(0,62)}%;
+  EL.stars.innerHTML='';
+  for(let i=0;i<50;i++){
+    const s=document.createElement('div'); s.className='star';
+    const sz=rnd(1,2.5);
+    s.style.cssText=`left:${rnd(0,100)}%;top:${rnd(0,60)}%;
       width:${sz}px;height:${sz}px;
-      --a:${rand(0.2,0.5).toFixed(2)};--b:${rand(0.7,1).toFixed(2)};
-      --dur:${rand(1.5,4).toFixed(1)}s;animation-delay:${rand(0,3).toFixed(1)}s`;
-    D.starsLayer.appendChild(s);
+      --a:${rnd(.2,.5).toFixed(2)};--b:${rnd(.7,1).toFixed(2)};
+      --dur:${rnd(2,5).toFixed(1)}s;animation-delay:${rnd(0,3).toFixed(1)}s`;
+    EL.stars.appendChild(s);
   }
-
-  // Nuvens
-  D.cloudsLayer.innerHTML = '';
-  for (let i = 0; i < 5; i++) {
-    const c = document.createElement('div');
-    c.className = 'cloud';
-    const spd = rand(35,80);
-    c.style.cssText = `width:${rand(100,280)}px;height:${rand(25,60)}px;
-      top:${rand(5,42)}%;opacity:${rand(0.18,0.45).toFixed(2)};
-      animation-duration:${spd.toFixed(0)}s;
-      animation-delay:-${rand(0,spd).toFixed(0)}s;
-      left:-320px`;
-    D.cloudsLayer.appendChild(c);
+  // Nuvens (animação CSS pura)
+  EL.clouds.innerHTML='';
+  for(let i=0;i<4;i++){
+    const c=document.createElement('div'); c.className='cloud';
+    const sp=rnd(50,100);
+    c.style.cssText=`width:${rnd(120,280)}px;height:${rnd(26,60)}px;
+      top:${rnd(5,42)}%;opacity:${rnd(.15,.4).toFixed(2)};
+      animation-duration:${sp.toFixed(0)}s;animation-delay:-${rnd(0,sp).toFixed(0)}s`;
+    EL.clouds.appendChild(c);
   }
-
-  // Prédios
   buildBuildings();
 }
 
-function buildBuildings() {
-  D.cityLayer.innerHTML = '';
-  const vw = window.innerWidth;
-  const colors = ['#0e0e22','#111128','#0c0c1e','#141430','#0a0a18','#181830'];
-  let x = -40;
-  while (x < vw + 200) {
-    const w = randInt(55,120);
-    const h = randInt(80,260);
-    const bld = document.createElement('div');
-    bld.className = 'bld';
-    bld.style.cssText = `left:${x}px;width:${w}px`;
-    const body = document.createElement('div');
-    body.className = 'bld-body';
-    body.style.cssText = `height:${h}px;--bc:${colors[randInt(0,colors.length-1)]}`;
-    // Antena
-    if (Math.random() > 0.5) {
-      const ant = document.createElement('div');
-      ant.className = 'antenna';
-      body.appendChild(ant);
-    }
-    // Janelas
-    const cols = Math.floor(w/18), rows = Math.floor(h/20);
-    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
-      const win = document.createElement('div');
-      const t = Math.random() < 0.25 ? 'o' : Math.random() < 0.5 ? 'w' : 'c';
-      win.className = `bld-win ${t}`;
-      win.style.cssText = `width:8px;height:7px;left:${8+c*16}px;top:${10+r*18}px`;
+function buildBuildings(){
+  EL.city.innerHTML=''; _blds=[];
+  const vw=window.innerWidth;
+  const pal=['#0e0e22','#111128','#0c0c1e','#141430','#0a0a18','#181830'];
+  let x=-50;
+  while(x<vw+220){
+    const w=rInt(55,110), h=rInt(80,240);
+    const el=document.createElement('div'); el.className='bld';
+    el.style.cssText=`left:${x}px;width:${w}px`;
+    const body=document.createElement('div'); body.className='bld-body';
+    body.style.cssText=`width:${w}px;height:${h}px;--bc:${pal[rInt(0,pal.length-1)]}`;
+    if(Math.random()>.5){ const a=document.createElement('div'); a.className='ant'; body.appendChild(a); }
+    const cols=Math.min(Math.floor(w/20),5), rows=Math.min(Math.floor(h/22),10);
+    for(let r=0;r<rows;r++) for(let c=0;c<cols;c++){
+      const win=document.createElement('div');
+      win.className='bw '+(Math.random()<.25?'o':Math.random()<.5?'w':'c');
+      win.style.cssText=`left:${8+c*18}px;top:${10+r*20}px`;
       body.appendChild(win);
     }
-    bld.appendChild(body);
-    D.cityLayer.appendChild(bld);
-    x += w + randInt(8,25);
+    el.appendChild(body); EL.city.appendChild(el);
+    _blds.push({ el, curX:x, w });
+    x+=w+rInt(8,22);
   }
 }
 
-/* ══════════════════════════════════════════════════
-   HORDA — criação e gestão
-══════════════════════════════════════════════════ */
-function createZombieEl(index) {
-  const el = document.createElement('div');
-  const colorClass = `zc${index % 4}`;
-  let bonusCls = G.bonus ? `bonus-${G.bonus}` : '';
-  el.className = `zombie-unit ${colorClass} ${bonusCls}`;
-  el.innerHTML = `
-    <div style="position:relative">
-      <div class="z-arms"><div class="z-arm"></div><div class="z-arm"></div></div>
-      <div class="z-head"></div>
-      <div class="z-torso"></div>
-      <div class="z-legs"><div class="z-leg"></div><div class="z-leg"></div></div>
-    </div>
-    <div class="z-shadow"></div>
-  `;
-  D.hordeLayer.appendChild(el);
-  return el;
-}
-
-function addZombie(count = 1) {
-  for (let i = 0; i < count; i++) {
-    const idx = G.zombies.length;
-    const xPos = C.PLAYER_X_BASE - idx * C.ZOMBIE_SPACING;
-    const el = createZombieEl(idx);
-    G.zombies.push({ el, x: xPos, y: 0, vy: 0, onGround: true, jumpCount: 0, dead: false });
-    positionZombie(G.zombies[G.zombies.length - 1]);
-  }
-  updateHUD();
-}
-
-function removeZombie(reason = 'hit') {
-  const alive = G.zombies.filter(z => !z.dead);
-  if (alive.length === 0) return;
-  const last = alive[alive.length - 1];
-  last.dead = true;
-  // FX de morte
-  if (reason === 'bomb' || reason === 'vehicle') spawnFX(last.x + 10, groundPx() + last.y + 30, 'blood', 6);
-  if (reason === 'hole') spawnFX(last.x + 10, groundPx(), 'dust', 5);
-  // Fade out
-  last.el.style.transition = 'opacity .3s';
-  last.el.style.opacity = '0';
-  setTimeout(() => { last.el.remove(); G.zombies = G.zombies.filter(z => z !== last); updateHUD(); }, 320);
-
-  const remaining = G.zombies.filter(z => !z.dead).length;
-  if (remaining === 0 && !G.bonus) {
-    setTimeout(triggerGameOver, 400);
+function updateParallax(dt){
+  const vw=window.innerWidth, spd=G.speed*0.28*dt;
+  for(let i=0;i<_blds.length;i++){
+    const b=_blds[i]; b.curX-=spd;
+    b.el.style.left=b.curX+'px';
+    if(b.curX+b.w<-60){ b.curX=vw+rInt(10,50); b.el.style.left=b.curX+'px'; }
   }
 }
 
-function positionZombie(z) {
-  const gPx = groundPx();
-  const px = 100 - (gPx / window.innerHeight) * 100;
-  z.el.style.left = z.x + 'px';
-  z.el.style.bottom = px + '%';
-  z.el.style.transform = `translateY(-${z.y}px)`;
+/* ════════════════════════════════════════════════
+   HORDA — criação e física
+════════════════════════════════════════════════ */
+function makeZEl(idx){
+  const el=document.createElement('div');
+  el.className=`zu zc${idx%4}`;
+  el.innerHTML=`<div style="position:relative">
+    <div class="zarms"><div class="zarm"></div><div class="zarm"></div></div>
+    <div class="zhead"></div><div class="ztorso"></div>
+    <div class="zlegs"><div class="zleg"></div><div class="zleg"></div></div>
+  </div><div class="zshadow"></div>`;
+  const sx=CFG.PLAYER_X-idx*CFG.ZOMBIE_GAP;
+  el.style.left=sx+'px';
+  el.style.bottom=CFG.GROUND_PCT+'%';
+  if(G.bonus) el.classList.add('bns-'+G.bonus);
+  EL.hordeEl.appendChild(el);
+  return { el, sx, y:0, vy:0, onGround:true, jCount:0, dead:false };
 }
 
-/* ══════════════════════════════════════════════════
+function addZombies(n=1){
+  for(let i=0;i<n;i++) G.horde.push(makeZEl(G.horde.length));
+  hudHorde();
+}
+
+function killZombie(reason){
+  // Mata o último zumbi vivo
+  for(let i=G.horde.length-1;i>=0;i--){
+    const z=G.horde[i]; if(z.dead) continue;
+    z.dead=true;
+    if(reason==='bomb'||reason==='car') fx(z.sx,32,'blood',4);
+    if(reason==='hole') fx(z.sx,2,'dust',3);
+    z.el.style.transition='opacity .25s'; z.el.style.opacity='0';
+    setTimeout(()=>{ z.el.remove(); G.horde=G.horde.filter(h=>h!==z); checkDead(); hudHorde(); },270);
+    break;
+  }
+}
+
+function checkDead(){
+  let alive=0; for(let i=0;i<G.horde.length;i++) if(!G.horde[i].dead) alive++;
+  if(alive===0 && !G.bonus) setTimeout(gameOver,300);
+}
+
+function posHorde(){
+  for(let i=0;i<G.horde.length;i++){
+    const z=G.horde[i]; if(z.dead) continue;
+    z.el.style.transform=`translateY(${-z.y}px)`;
+  }
+}
+
+/* ════════════════════════════════════════════════
    FÍSICA DE PULO
-══════════════════════════════════════════════════ */
-function initiateJump() {
-  if (!G.running || G.paused) return;
-  // Ninja tem double jump; outros têm 1 pulo
-  const maxJumps = G.bonus === 'ninja' ? 2 : 1;
-  const alive = G.zombies.filter(z => !z.dead);
-  if (alive.length === 0) return;
+════════════════════════════════════════════════ */
+function jump(){
+  if(!G.on||G.paused||G.bonus==='balloon') return;
+  const maxJ=G.bonus==='ninja'?2:1;
+  let leader=null;
+  for(let i=0;i<G.horde.length;i++) if(!G.horde[i].dead){ leader=G.horde[i]; break; }
+  if(!leader||leader.jCount>=maxJ) return;
 
-  const leader = alive[0];
-  if (leader.jumpCount < maxJumps) {
-    const force = G.bonus === 'dragon' ? C.JUMP_FORCE * 0.85 : C.JUMP_FORCE;
-    alive.forEach(z => {
-      z.vy = force;
-      z.onGround = false;
-      z.jumpCount++;
-    });
-    G.jumping = true;
-    G.isHolding = true;
-    G.holdTime = 0;
-    spawnFX(alive[0].x + 10, groundPx(), 'dust', 4);
+  const v=G.bonus==='dragon'?CFG.JUMP_V*0.82:CFG.JUMP_V;
+  for(let i=0;i<G.horde.length;i++){
+    const z=G.horde[i]; if(z.dead) continue;
+    z.vy=v; z.onGround=false; z.jCount++;
   }
+  G.holding=true; G.holdMs=0;
+  fx(CFG.PLAYER_X+8,2,'dust',3);
 }
 
-function releaseJump() {
-  G.isHolding = false;
-}
+function releaseJump(){ G.holding=false; }
 
-function updateHorde() {
-  // Usa índice para evitar criar array novo a cada frame
-  let aliveCount = 0;
-  for (let i = 0; i < G.zombies.length; i++) {
-    if (!G.zombies[i].dead) aliveCount++;
-  }
-  if (aliveCount === 0) return;
-
-  const t = Date.now();
-
-  for (let i = 0, aliveIdx = 0; i < G.zombies.length; i++) {
-    const z = G.zombies[i];
-    if (z.dead) continue;
-
-    if (G.bonus === 'balloon') {
-      // Balloon: flutua suavemente ACIMA do chão, sempre visível
-      // Oscila entre 35px e 65px acima do chão
-      const targetY = 48 + Math.sin(t * 0.003 + aliveIdx * 0.8) * 16;
-      z.y += (targetY - z.y) * 0.08; // suaviza a transição
-      z.vy = 0;
-      z.onGround = false;
-      z.jumpCount = 1; // impede pulo duplo acidental
-    } else {
-      // Física normal
-      if (!z.onGround) {
-        // Hold acrescenta leve impulso para cima
-        if (G.isHolding && G.holdTime < 300 && z.vy < 0) {
-          z.vy += G.bonus === 'dragon' ? -0.15 : -0.08;
-          G.holdTime += 16;
-        }
-        // Dragon plana ao segurar após pulo
-        if (G.bonus === 'dragon' && G.isHolding && z.vy > 0) z.vy *= 0.92;
-
-        z.vy += C.GRAVITY;
-        z.y  -= z.vy;
-
-        if (z.y <= 0) {
-          z.y  = 0;
-          z.vy = 0;
-          z.onGround  = true;
-          z.jumpCount = 0;
-          G.jumping   = false;
-        }
-      }
+function stepPhysics(){
+  // Balloon: flutua suavemente — sem pulo, sem buracos
+  if(G.bonus==='balloon'){
+    const target=52+Math.sin(performance.now()*0.003)*14;
+    for(let i=0;i<G.horde.length;i++){
+      const z=G.horde[i]; if(z.dead) continue;
+      z.y+=(target-z.y)*0.08; z.vy=0; z.onGround=false; z.jCount=1;
     }
-
-    positionZombie(z);
-    aliveIdx++;
+    posHorde(); return;
   }
+
+  for(let i=0;i<G.horde.length;i++){
+    const z=G.horde[i]; if(z.dead||z.onGround) continue;
+    // hold prolonga pulo
+    if(G.holding && G.holdMs<CFG.HOLD_MAX && z.vy<0){
+      z.vy-=CFG.HOLD_BOOST; G.holdMs+=16;
+    }
+    // dragon plana
+    if(G.bonus==='dragon' && G.holding && z.vy>0) z.vy*=0.92;
+    z.vy+=CFG.GRAVITY;
+    z.y -=z.vy;
+    if(z.y<=0){ z.y=0; z.vy=0; z.onGround=true; z.jCount=0; }
+  }
+  posHorde();
 }
 
-/* ══════════════════════════════════════════════════
-   SPAWN DE OBJETOS DO MUNDO
-══════════════════════════════════════════════════ */
-let spawnCooldown = 0;
-const SPAWN_MIN = 900, SPAWN_MAX = 2600;
+/* ════════════════════════════════════════════════
+   SPAWN DE OBJETOS
+   nextWX() → coordenada world-space logo além da tela
+════════════════════════════════════════════════ */
+function nextWX(){ return G.worldX+window.innerWidth+80; }
 
-function scheduleSpawn() {
-  clearTimeout(G.spawnTimer);
-  if (!G.running) return;
-  const delay = rand(SPAWN_MIN, SPAWN_MAX) * Math.max(0.4, 1 - (G.score / 5000));
-  G.spawnTimer = setTimeout(spawnWorldObject, delay);
+function scheduleSpawn(delay){
+  clearTimeout(G.spawnTid);
+  if(!G.on) return;
+  const d=delay ?? Math.max(CFG.SPAWN_MIN, rnd(CFG.SPAWN_MIN,CFG.SPAWN_MAX)-G.score*0.1);
+  G.spawnTid=setTimeout(doSpawn,d);
 }
 
-function spawnWorldObject() {
-  if (!G.running || G.paused) return;
-  const r = Math.random();
-  const vw = window.innerWidth;
-  const gPx = groundPx();
-
-  if (r < 0.20) spawnHole();
-  else if (r < 0.35) spawnHuman();
-  else if (r < 0.48) spawnVehicleStationary();
-  else if (r < 0.56) spawnVehicleMoving();
-  else if (r < 0.67) spawnBomb();
-  else if (r < 0.77) spawnMysteryBox();
-  else if (r < 0.88) spawnCoinRow();
-  else spawnBrainItem();
-
+function doSpawn(){
+  if(!G.on||G.paused) return;
+  const r=Math.random();
+  // Probabilidades balanceadas: humanos frequentes, buracos raros no início
+  if     (r<.15) spawnHole();
+  else if(r<.35) spawnHumans();
+  else if(r<.50) spawnVStop();
+  else if(r<.58) spawnVMove();
+  else if(r<.68) spawnBombs();
+  else if(r<.78) spawnBox();
+  else if(r<.90) spawnCoins();
+  else           spawnBrain();
   scheduleSpawn();
 }
 
-/* ── BURACO ─────────────────────────────────────── */
-function spawnHole() {
-  const vw  = window.innerWidth;
-  const gPx = groundPx();
-  const w   = randInt(55, 140);
-  const el  = document.createElement('div');
-  el.className = 'hole';
-  el.style.cssText = `left:${vw + 10}px;width:${w}px;height:${gPx * 0.95}px`;
-  D.holesLayer.appendChild(el);
-  G.holes.push({ el, x: vw + 10, w });
+/* ── Buraco ── */
+function spawnHole(){
+  const wx=nextWX(), w=rInt(60,120);
+  const el=document.createElement('div'); el.className='hole';
+  el.style.cssText=`left:${wx}px;width:${w}px`;
+  EL.holesEl.appendChild(el);
+  G.holes.push({el,wx,w});
 }
 
-/* ── HUMANO ─────────────────────────────────────── */
-function spawnHuman(count = 1) {
-  const vw = window.innerWidth;
-  for (let i = 0; i < count; i++) {
-    const type = C.HUMAN_TYPES[randInt(0, C.HUMAN_TYPES.length - 1)];
-    const el = document.createElement('div');
-    el.className = `wobj human ${type}`;
-    el.innerHTML = `<div class="h-head"></div><div class="h-body"></div><div class="h-legs"><div class="h-leg"></div><div class="h-leg"></div></div>`;
-    el.style.left = (vw + 10 + i * 40) + 'px';
-    D.worldLayer.appendChild(el);
-    G.worldObjs.push({ el, x: vw + 10 + i * 40, w: 16, type: 'human', data: {} });
+/* ── Humanos ── */
+function spawnHumans(n=rInt(1,3)){
+  for(let i=0;i<n;i++){
+    const wx=nextWX()+i*38;
+    const t=CFG.HUMAN_T[rInt(0,CFG.HUMAN_T.length-1)];
+    const el=document.createElement('div'); el.className=`wobj human ${t}`;
+    el.innerHTML=`<div class="hhead"></div><div class="hbody"></div>
+      <div class="hlegs"><div class="hleg"></div><div class="hleg"></div></div>`;
+    el.style.left=wx+'px';
+    EL.worldEl.appendChild(el);
+    G.objs.push({el,wx,w:16,type:'human',extra:{}});
   }
 }
 
-/* ── VEÍCULO PARADO ─────────────────────────────── */
-function spawnVehicleStationary() {
-  const vw    = window.innerWidth;
-  const keys  = Object.keys(C.VEHICLES);
-  // Veículos mais difíceis aparecem mais tarde
-  const maxIdx = G.score < 200 ? 1 : G.score < 500 ? 2 : 3;
-  const key   = keys[randInt(0, maxIdx)];
-  const cfg   = C.VEHICLES[key];
+/* ── Veículo parado ── */
+function spawnVStop(){
+  const keys=Object.keys(CFG.VEH);
+  const maxI=G.score<150?1:G.score<400?2:3;
+  const key=keys[rInt(0,maxI)];
+  const v=CFG.VEH[key];
+  const wx=nextWX();
 
-  const wrap  = document.createElement('div');
-  wrap.className = 'wobj vehicle v-' + key;
-  wrap.style.cssText = `left:${vw + 10}px;bottom:${groundPx()}px;position:absolute`;
+  const wrap=document.createElement('div');
+  wrap.className=`wobj vehicle v${key[0]}`;
+  wrap.style.left=wx+'px';
 
-  const req   = document.createElement('div');
-  req.className = 'v-req';
-  req.textContent = cfg.label;
+  const req=document.createElement('div'); req.className='vreq'; req.textContent=v.label;
+  const body=document.createElement('div'); body.className='vbody';
 
-  const body  = document.createElement('div');
-  body.className = 'v-body';
-  body.style.cssText = `width:${cfg.w}px;height:${cfg.h}px`;
-
-  if (key === 'car' || key === 'bus') {
-    ['wl','wm','wr'].slice(0, key === 'car' ? 2 : 3).forEach(cls => {
-      const w = document.createElement('div');
-      w.className = 'wheel ' + cls;
-      body.appendChild(w);
-    });
-  }
-  if (key === 'tank') {
-    const cannon = document.createElement('div'); cannon.className = 'cannon';
-    const track  = document.createElement('div'); track.className  = 'track';
-    [['wl',6],['wm',30],['wr',58]].forEach(([c,l]) => {
-      const w = document.createElement('div'); w.className = 'wheel ' + c;
-      w.style.left = l + 'px'; body.appendChild(w);
-    });
-    body.appendChild(cannon); body.appendChild(track);
-  }
-  if (key === 'plane') {
-    ['wing','tail'].forEach(c => { const d = document.createElement('div'); d.className=c; body.appendChild(d); });
+  if(key==='car'){
+    ['wl','wr'].forEach(c=>{const w=document.createElement('div');w.className='wh '+c;body.appendChild(w);});
+  }else if(key==='bus'){
+    ['wl','wm','wr'].forEach(c=>{const w=document.createElement('div');w.className='wh '+c;body.appendChild(w);});
+  }else if(key==='tank'){
+    const tr=document.createElement('div');tr.className='track';
+    const cn=document.createElement('div');cn.className='cannon';
+    [6,30,62].forEach(l=>{const w=document.createElement('div');w.className='wh';w.style.left=l+'px';body.appendChild(w);});
+    body.appendChild(tr);body.appendChild(cn);
+  }else if(key==='plane'){
+    ['wing','tail'].forEach(c=>{const d=document.createElement('div');d.className=c;body.appendChild(d);});
   }
 
-  wrap.appendChild(req);
+  wrap.appendChild(req); wrap.appendChild(body);
+  EL.worldEl.appendChild(wrap);
+  G.objs.push({el:wrap,wx,w:v.w,type:'vstop',extra:{key,v}});
+}
+
+/* ── Veículo em movimento ── */
+function spawnVMove(){
+  const isCar=Math.random()<.65;
+  const key=isCar?'car':'bus'; const v=CFG.VEH[key];
+  const wx=nextWX()+180;
+  const wrap=document.createElement('div');
+  wrap.className=`wobj vehicle v${key[0]} moving`;
+  wrap.style.left=wx+'px';
+  const body=document.createElement('div'); body.className='vbody';
+  if(isCar){['wl','wr'].forEach(c=>{const w=document.createElement('div');w.className='wh '+c;body.appendChild(w);});}
+  else{['wl','wm','wr'].forEach(c=>{const w=document.createElement('div');w.className='wh '+c;body.appendChild(w);});}
   wrap.appendChild(body);
-  D.worldLayer.appendChild(wrap);
-  G.worldObjs.push({ el: wrap, x: vw + 10, w: cfg.w, type: 'vehicle_stop', data: { key, cfg, flipped: false } });
+  EL.worldEl.appendChild(wrap);
+  G.objs.push({el:wrap,wx,w:v.w,type:'vmove',extra:{spd:G.speed*1.5}});
+
+  // Aviso
+  const warn=document.createElement('div'); warn.className='warn'; warn.textContent='⚠ ATENÇÃO!';
+  document.body.appendChild(warn); setTimeout(()=>warn.remove(),1000);
 }
 
-/* ── VEÍCULO EM MOVIMENTO ───────────────────────── */
-function spawnVehicleMoving() {
-  const vw = window.innerWidth;
-  const isCar = Math.random() < 0.7;
-  const el = document.createElement('div');
-  el.className = 'wobj vehicle v-' + (isCar ? 'car' : 'bus');
-  const cfg = isCar ? C.VEHICLES.car : C.VEHICLES.bus;
-  el.style.cssText = `left:${vw + 200}px;bottom:${groundPx()}px;position:absolute`;
-
-  const body = document.createElement('div');
-  body.className = 'v-body';
-  body.style.cssText = `width:${cfg.w}px;height:${cfg.h}px;background:linear-gradient(to bottom,#991111,#660000)`;
-  el.appendChild(body);
-
-  // Sinal de aviso
-  const warn = document.createElement('div');
-  warn.className = 'warn-sign';
-  warn.textContent = '⚠ VEÍCULO EM MOVIMENTO!';
-  document.body.appendChild(warn);
-  setTimeout(() => warn.remove(), 1200);
-
-  D.worldLayer.appendChild(el);
-  G.worldObjs.push({ el, x: vw + 200, w: cfg.w, type: 'vehicle_move', data: { speed: G.speed * 1.8 } });
-}
-
-/* ── BOMBA ──────────────────────────────────────── */
-function spawnBomb(air = false) {
-  const count = randInt(1, air ? 1 : 4);
-  const vw    = window.innerWidth;
-  for (let i = 0; i < count; i++) {
-    const el  = document.createElement('div');
-    el.className = 'wobj bomb' + (air ? ' air' : '');
-    el.style.left = (vw + 10 + i * 40) + 'px';
-    if (!air) el.style.bottom = groundPx() + 'px';
-    D.worldLayer.appendChild(el);
-    G.worldObjs.push({ el, x: vw + 10 + i * 40, w: 28, type: air ? 'bomb_air' : 'bomb', data: {} });
+/* ── Bombas ── */
+function spawnBombs(){
+  const isAir=Math.random()<.28, n=isAir?1:rInt(1,4);
+  for(let i=0;i<n;i++){
+    const wx=nextWX()+i*38;
+    const el=document.createElement('div'); el.className='wobj bomb'+(isAir?' air':'');
+    el.style.left=wx+'px';
+    EL.worldEl.appendChild(el);
+    G.objs.push({el,wx,w:26,type:isAir?'bomb_air':'bomb',extra:{}});
   }
 }
 
-/* ── CAIXA MISTERIOSA ───────────────────────────── */
-function spawnMysteryBox() {
-  const vw = window.innerWidth;
-  const el = document.createElement('div');
-  el.className = 'wobj mystery-box';
-  el.textContent = '?';
-  el.style.cssText = `left:${vw + 10}px;bottom:${groundPx()}px;position:absolute`;
-  D.worldLayer.appendChild(el);
-  G.worldObjs.push({ el, x: vw + 10, w: 36, type: 'mystery', data: {} });
+/* ── Caixa misteriosa ── */
+function spawnBox(){
+  const wx=nextWX();
+  const el=document.createElement('div'); el.className='wobj box'; el.textContent='?';
+  el.style.left=wx+'px';
+  EL.worldEl.appendChild(el);
+  G.objs.push({el,wx,w:36,type:'box',extra:{}});
 }
 
-/* ── MOEDAS ─────────────────────────────────────── */
-function spawnCoinRow() {
-  const vw    = window.innerWidth;
-  const count = randInt(3, 8);
-  const baseH = groundPx() + rand(10, 80);
-  for (let i = 0; i < count; i++) {
-    const el = document.createElement('div');
-    el.className = 'wobj coin';
-    el.style.cssText = `left:${vw + i * 28}px;bottom:${baseH}px;position:absolute`;
-    D.worldLayer.appendChild(el);
-    G.worldObjs.push({ el, x: vw + i * 28, w: 18, type: 'coin', data: {} });
+/* ── Moedas ── */
+function spawnCoins(){
+  const n=rInt(3,8), bh=rInt(10,80);
+  for(let i=0;i<n;i++){
+    const wx=nextWX()+i*26;
+    const el=document.createElement('div'); el.className='wobj coin';
+    el.style.cssText=`left:${wx}px;bottom:${bh}px`;
+    EL.worldEl.appendChild(el);
+    G.objs.push({el,wx,w:18,type:'coin',extra:{bh}});
   }
 }
 
-/* ── CÉREBRO ─────────────────────────────────────── */
-function spawnBrainItem() {
-  const vw = window.innerWidth;
-  const el = document.createElement('div');
-  el.className = 'wobj brain-item';
-  el.textContent = '🧠';
-  el.style.cssText = `left:${vw + 10}px;bottom:${groundPx() + rand(20, 90)}px;position:absolute`;
-  D.worldLayer.appendChild(el);
-  G.worldObjs.push({ el, x: vw + 10, w: 22, type: 'brain', data: {} });
+/* ── Cérebro ── */
+function spawnBrain(){
+  const wx=nextWX(), bh=rInt(20,80);
+  const el=document.createElement('div'); el.className='wobj brain'; el.textContent='🧠';
+  el.style.cssText=`left:${wx}px;bottom:${bh}px`;
+  EL.worldEl.appendChild(el);
+  G.objs.push({el,wx,w:22,type:'brain',extra:{bh}});
 }
 
-/* ══════════════════════════════════════════════════
-   ATUALIZAR OBJETOS DO MUNDO
-══════════════════════════════════════════════════ */
-/* ══════════════════════════════════════════════════
-   ATUALIZAR OBJETOS DO MUNDO — for loops, sem forEach
-══════════════════════════════════════════════════ */
-function updateWorldObjects() {
-  let removeCount = 0;
-  for (let i = 0; i < G.worldObjs.length; i++) {
-    const obj = G.worldObjs[i];
-    const spd = obj.type === 'vehicle_move' ? obj.data.speed + G.speed : G.speed;
-    obj.x -= spd;
-    obj.el.style.left = obj.x + 'px';
-    if (obj.x + obj.w < -20) { obj.el.remove(); obj._remove = true; removeCount++; }
-  }
-  if (removeCount > 0) G.worldObjs = G.worldObjs.filter(o => !o._remove);
+/* ════════════════════════════════════════════════
+   ATUALIZAR MUNDO (mover objetos com câmera)
+════════════════════════════════════════════════ */
+function stepWorld(dt){
+  G.worldX+=G.speed*dt;
+  applyCamera();
 
-  // Buracos
-  let removeHoles = 0;
-  for (let i = 0; i < G.holes.length; i++) {
-    const h = G.holes[i];
-    h.x -= G.speed;
-    h.el.style.left = h.x + 'px';
-    if (h.x + h.w < -20) { h.el.remove(); h._remove = true; removeHoles++; }
+  // Veículos em movimento: têm velocidade extra além da câmera
+  for(let i=0;i<G.objs.length;i++){
+    const o=G.objs[i];
+    if(o.type==='vmove'){ o.wx-=o.extra.spd*dt; o.el.style.left=o.wx+'px'; }
   }
-  if (removeHoles > 0) G.holes = G.holes.filter(h => !h._remove);
+
+  // Remove objetos que saíram pela esquerda
+  const cutX=G.worldX-200;
+  let rm=false;
+  for(let i=0;i<G.objs.length;i++){
+    if(G.objs[i].wx<cutX){ G.objs[i].el.remove(); G.objs[i]._rm=true; rm=true; }
+  }
+  if(rm) G.objs=G.objs.filter(o=>!o._rm);
+
+  let rmH=false;
+  for(let i=0;i<G.holes.length;i++){
+    if(G.holes[i].wx<cutX){ G.holes[i].el.remove(); G.holes[i]._rm=true; rmH=true; }
+  }
+  if(rmH) G.holes=G.holes.filter(h=>!h._rm);
 }
 
-/* ══════════════════════════════════════════════════
-   COLISÃO — otimizada: for loops diretos, sem filter()
-══════════════════════════════════════════════════ */
-function checkCollisions() {
-  // Encontra leader sem criar array novo
-  let leader = null;
-  for (let i = 0; i < G.zombies.length; i++) {
-    if (!G.zombies[i].dead) { leader = G.zombies[i]; break; }
-  }
-  if (!leader) return;
+/* ════════════════════════════════════════════════
+   COLISÃO
+   
+   Regras fiéis ao original:
+   - Humanos: come → +1 zumbi
+   - Veículo PARADO: horda suficiente → vira (recompensa)
+                     horda insuficiente → mata 1 zumbi
+   - Veículo MOVIMENTO: sempre mata 1 (a menos que bonus)
+   - Bomba: mata 1 (a menos que bonus)
+   - Buraco: zumbi no chão → cai e morre (a menos que balloon)
+   - Caixa: ativa bonus aleatório
+   - Moeda/cérebro: coleta
 
-  const gPx = groundPx(); // chama uma vez só
+   HITBOX X: líder está sempre em px=CFG.PLAYER_X.
+   Para veículos: o objeto está em world-space,
+   convertido para screen-space: oSX = wx - worldX + PLAYER_X
+   Portanto colide quando PLAYER_X está dentro de [oSX, oSX+w].
+   Simplificado: colide se worldX está dentro de [wx-PLAYER_X, wx+w-PLAYER_X]
+   Ou seja: wx <= worldX+PLAYER_X && wx+w >= worldX
+   
+   HITBOX Y veículos: só colide se líder.y <= 10 (no chão).
+   Isso permite pular por cima de qualquer veículo.
+════════════════════════════════════════════════ */
+function stepCollisions(){
+  // Líder = primeiro zumbi vivo
+  let leader=null;
+  for(let i=0;i<G.horde.length;i++) if(!G.horde[i].dead){ leader=G.horde[i]; break; }
+  if(!leader) return;
 
-  // ── BURACOS ──────────────────────────────────────
-  if (G.bonus !== 'balloon') {
-    for (let hi = 0; hi < G.holes.length; hi++) {
-      const h = G.holes[hi];
-      for (let zi = 0; zi < G.zombies.length; zi++) {
-        const z = G.zombies[zi];
-        if (z.dead) continue;
-        const inHole  = (z.x + 20) > (h.x + 5) && z.x < (h.x + h.w - 5);
-        const atGround= z.y <= 2;
-        if (inHole && atGround && !z._inHole) {
-          z._inHole = true;
-          setTimeout(() => {
-            if (!z.dead) { removeZombie('hole'); z._inHole = false; }
-          }, 200);
+  const leaderY=leader.y;  // 0=chão, >0=ar
+  const wx=G.worldX;       // posição da câmera
+
+  // ── BURACOS ──
+  if(G.bonus!=='balloon'){
+    for(let hi=0;hi<G.holes.length;hi++){
+      const h=G.holes[hi];
+      // Posição do buraco em screen: hSX = h.wx - wx + PLAYER_X
+      // O zumbi (i) está em screen sx = CFG.PLAYER_X - i*GAP
+      for(let zi=0;zi<G.horde.length;zi++){
+        const z=G.horde[zi]; if(z.dead) continue;
+        const zSX=CFG.PLAYER_X-zi*CFG.ZOMBIE_GAP;
+        const hSX=h.wx-wx+CFG.PLAYER_X;
+        const inH=(zSX+16)>hSX+4 && zSX<hSX+h.w-4;
+        if(inH && z.y<=1 && !z._hole){
+          z._hole=true;
+          setTimeout(()=>{ if(!z.dead){ killZombie('hole'); z._hole=false; } },120);
         }
-        if (!inHole) z._inHole = false;
+        if(!inH) z._hole=false;
       }
     }
   }
 
-  // ── OBJETOS DO MUNDO ─────────────────────────────
-  const toRemove = [];
-  for (let oi = 0; oi < G.worldObjs.length; oi++) {
-    const obj = G.worldObjs[oi];
-    if (obj._hit) continue;
+  // ── OBJETOS ──
+  const kill=[];
+  for(let oi=0;oi<G.objs.length;oi++){
+    const o=G.objs[oi]; if(o._hit) continue;
 
-    const overlapX = (leader.x + 18) > obj.x && leader.x < (obj.x + obj.w);
-    if (!overlapX) continue;
+    // Colisão X: objeto entra na faixa do líder?
+    // líder está em PLAYER_X, objeto em world-space
+    // colide se: o.wx <= worldX && o.wx+o.w >= worldX (i.e. PLAYER_X está no objeto)
+    // Margem de 12px para hitbox justa
+    const oLeft  = o.wx-wx;           // posição relativa ao PLAYER_X
+    const oRight = oLeft+o.w;
+    if(oLeft > 14 || oRight < -14) continue;  // fora do range X
 
-    // Cache o bottom para não chamar parseFloat todo frame
-    if (obj._cachedBottom === undefined) {
-      obj._cachedBottom = parseFloat(obj.el.style.bottom) || gPx;
+    // Veículos: só colidem se no chão
+    const isVeh=o.type==='vstop'||o.type==='vmove';
+    if(isVeh && leaderY>10) continue;  // pulando → passa por cima
+
+    // Bomba no ar: só colide se no ar
+    if(o.type==='bomb_air' && leaderY<=20) continue;
+
+    // Moeda/cérebro: checa altura
+    if(o.type==='coin'||o.type==='brain'){
+      const bh=o.extra.bh||0;
+      if(leaderY+56<bh || leaderY>bh+20) continue;
     }
-    const objBottom = obj._cachedBottom;
-    const objTop    = objBottom + (obj.type === 'coin' ? 18 : obj.type === 'brain' ? 22 : 50);
-    const zBottom   = gPx + leader.y;
-    const zTop      = zBottom + 52;
-    const overlapY  = zTop > objBottom && zBottom < objTop;
-    if (!overlapY) continue;
 
-    obj._hit = true;
+    o._hit=true;
 
-    switch (obj.type) {
+    switch(o.type){
       case 'human':
-        eatHuman(obj);
-        toRemove.push(obj);
+        fx(CFG.PLAYER_X+6,10,'blood',3);
+        G.eaten++; G.brains++;
+        addZombies(1);
+        toast('+1 🧟','#00ff88',700);
+        hudBrains();
+        kill.push(o);
         break;
-      case 'vehicle_stop':
-        hitVehicleStop(obj, toRemove);
-        break;
-      case 'vehicle_move':
-        if (G.bonus === 'balloon' || G.bonus === 'ninja' || G.bonus === 'quarterback' || G.bonus === 'tsunami') {
-          spawnFX(obj.x, gPx, 'coin-fx', 3);
-          toRemove.push(obj);
+
+      case 'vstop': {
+        let alive=0; for(let i=0;i<G.horde.length;i++) if(!G.horde[i].dead) alive++;
+        const bypass=['giantz','qb','tsunami','gold'].includes(G.bonus);
+        if(alive>=o.extra.v.req||bypass){
+          o.el.style.transform='rotate(-13deg)';
+          fx(CFG.PLAYER_X+28,20,'coin-fx',4);
+          const rw=o.extra.v.rew;
+          addZombies(rw); S.coins+=rw; G.brains+=rw;
+          if(G.bonus==='gold') S.coins+=o.extra.v.req;
+          toast(`+${rw}🧟 DESTRUÍDO!`,'#f5a623',900);
+          writeSave(); hudCoins(); hudBrains();
+          setTimeout(()=>o.el.remove(),340); kill.push(o);
         } else {
-          spawnFX(obj.x, gPx + 20, 'blood', 4);
-          removeZombie('vehicle');
-          toRemove.push(obj);
+          killZombie('car'); o._hit=false; o.wx+=4;
         }
         break;
+      }
+
+      case 'vmove':
+        if(['balloon','ninja','qb','tsunami'].includes(G.bonus)){
+          fx(CFG.PLAYER_X+28,20,'coin-fx',3); kill.push(o);
+        } else {
+          fx(CFG.PLAYER_X+10,22,'blood',4); killZombie('car'); kill.push(o);
+        }
+        break;
+
       case 'bomb':
-        if (G.bonus === 'balloon' || G.bonus === 'ninja' || G.bonus === 'quarterback' || G.bonus === 'tsunami' || G.bonus === 'gold') {
-          if (G.bonus === 'gold') save.coins += 2;
-          spawnFX(obj.x, gPx + 10, 'star-fx', 4);
+        if(['balloon','ninja','qb','tsunami','gold'].includes(G.bonus)){
+          if(G.bonus==='gold'){ S.coins+=2; hudCoins(); }
+          fx(CFG.PLAYER_X+10,16,'star-fx',4);
         } else {
-          showExplode(obj.x, gPx);
-          removeZombie('bomb');
+          boom(CFG.PLAYER_X+10,16); killZombie('bomb');
         }
-        toRemove.push(obj);
+        kill.push(o);
         break;
+
       case 'bomb_air':
-        if (leader.y > 20) {
-          if (G.bonus === 'ninja' || G.bonus === 'quarterback' || G.bonus === 'tsunami') {
-            spawnFX(obj.x, gPx + 60, 'star-fx', 3);
-          } else {
-            showExplode(obj.x, gPx + 80);
-            removeZombie('bomb');
-          }
-          toRemove.push(obj);
+        if(['ninja','qb','tsunami'].includes(G.bonus)){
+          fx(CFG.PLAYER_X+10,leaderY+14,'star-fx',3);
+        } else {
+          boom(CFG.PLAYER_X+10,leaderY+14); killZombie('bomb');
         }
+        kill.push(o);
         break;
-      case 'mystery':
-        collectMysteryBox(obj);
-        toRemove.push(obj);
+
+      case 'box':
+        activateBonus(BONUS_KEYS[rInt(0,BONUS_KEYS.length-1)]);
+        kill.push(o);
         break;
+
       case 'coin':
-        save.coins++;
-        G.coinsRun++;
-        spawnFX(obj.x, objBottom, 'coin-fx', 2);
-        toRemove.push(obj);
-        if (G.coinsRun % 5 === 0) saveData();
-        D.hCoins.textContent = save.coins;
+        S.coins++; G.coins++;
+        fx(o.wx-wx+CFG.PLAYER_X,o.extra.bh||0,'coin-fx',2);
+        if(G.coins%5===0) writeSave();
+        hudCoins(); kill.push(o);
         break;
+
       case 'brain':
         G.brains++;
-        spawnFX(obj.x, objBottom, 'brain-fx', 1);
-        toRemove.push(obj);
-        D.hBrains.textContent = G.brains;
+        fx(o.wx-wx+CFG.PLAYER_X,o.extra.bh||0,'star-fx',1);
+        hudBrains(); kill.push(o);
         break;
     }
   }
 
-  // Remove sem splice dentro de loop (mais rápido)
-  if (toRemove.length > 0) {
-    for (let i = 0; i < toRemove.length; i++) {
-      toRemove[i].el.remove();
-    }
-    G.worldObjs = G.worldObjs.filter(o => !o._hit || !o.el.parentNode === false);
-    // Limpa _hit só dos que não foram removidos (vehicle_stop pode ter _hit=false)
-    G.worldObjs = G.worldObjs.filter(o => !toRemove.includes(o));
+  for(let i=0;i<kill.length;i++){
+    const o=kill[i];
+    if(!o._removed){ o._removed=true; if(o.el.parentNode) o.el.remove(); }
+    const idx=G.objs.indexOf(o); if(idx!==-1) G.objs.splice(idx,1);
   }
 }
 
-/* ── Comer humano ─────────────────────────────────── */
-function eatHuman(obj) {
-  spawnFX(obj.x, groundPx() + 10, 'blood', 3);
-  G.eaten++;
-  G.brains++;
-  addZombie(1);
-  showToast('+1 🧟 ZUMBI!', '#00ff88', 900);
-  updateHUD();
-}
-
-/* ── Veículo parado ──────────────────────────────── */
-function hitVehicleStop(obj, toRemove) {
-  const alive = G.zombies.filter(z => !z.dead).length;
-  const req   = obj.data.cfg.req;
-  const gPx   = groundPx();
-
-  // Bonus especial ignora requisito
-  const ignores = G.bonus === 'giantz' || G.bonus === 'quarterback' || G.bonus === 'tsunami' || G.bonus === 'gold';
-
-  if (alive >= req || ignores) {
-    // Virar veículo → recompensa
-    obj.el.style.transform = 'rotate(-15deg)';
-    obj.el.style.transition = 'transform .3s';
-    spawnFX(obj.x, gPx, 'coin-fx', 5);
-    addZombie(obj.data.cfg.humans);
-    save.coins += obj.data.cfg.humans;
-    G.brains   += obj.data.cfg.humans;
-    if (G.bonus === 'gold') { save.coins += req; }
-    showToast(`+${obj.data.cfg.humans} 🧟 DESTRUÍDO!`, '#f5a623', 900);
-    saveData();
-    updateHUD();
-    setTimeout(() => { obj.el.remove(); }, 350);
-    toRemove.push(obj);
-  } else {
-    // Horda insuficiente → morre na parede
-    removeZombie('vehicle');
-    obj._hit = false; // permite nova colisão
-    obj.x += 5; // empurra ligeiramente
-  }
-}
-
-/* ── Mystery Box ─────────────────────────────────── */
-function collectMysteryBox(obj) {
-  // Cancela bonus ativo se houver
-  if (G.bonusTimer) clearTimeout(G.bonusTimer);
-  if (G.ufoCloneTimer) clearInterval(G.ufoCloneTimer);
-  if (G.ufoEl) { G.ufoEl.remove(); G.ufoEl = null; }
-  if (G.tsunamiEl) { G.tsunamiEl.remove(); G.tsunamiEl = null; }
-
-  // Remove classe de bonus anterior de todos os zumbis
-  G.zombies.forEach(z => {
-    z.el.className = z.el.className.replace(/bonus-\w+/g, '').trim();
-  });
-
-  const bonusKey = C.BONUS_KEYS[randInt(0, C.BONUS_KEYS.length - 1)];
-  activateBonus(bonusKey);
-}
-
-/* ══════════════════════════════════════════════════
+/* ════════════════════════════════════════════════
    BONUS / POWER-UPS
-══════════════════════════════════════════════════ */
-function activateBonus(key) {
-  G.bonus = key;
-  const bCfg = C.BONUSES[key];
-  const dur  = bCfg.duration + (save.upgrades.bonusDuration || 0) * 2000;
+════════════════════════════════════════════════ */
+function activateBonus(key){
+  clearBonus();
+  G.bonus=key;
+  const b=CFG.BONUS[key];
+  const dur=b.ms+(S.upg.bonMs||0)*2000;
 
-  // Visual HUD
-  D.bonusInd.textContent = `${bCfg.icon} ${bCfg.label}`;
-  D.bonusInd.style.color = bCfg.color;
-  D.bonusInd.classList.remove('hidden');
+  EL.bonusBar.textContent=`${b.icon} ${b.lbl}`;
+  EL.bonusBar.style.color=b.color;
+  EL.bonusBar.classList.remove('hidden');
+  for(let i=0;i<G.horde.length;i++) if(!G.horde[i].dead) G.horde[i].el.classList.add('bns-'+key);
+  toast(`${b.icon} ${b.lbl}!`,b.color,1400);
 
-  // Aplica classe visual nos zumbis
-  G.zombies.filter(z => !z.dead).forEach(z => {
-    z.el.classList.add(`bonus-${key}`);
-  });
+  if(key==='ufo')     doUFO();
+  if(key==='tsunami') doTsunami();
+  if(key==='giantz')  doGiantZ();
 
-  showToast(`${bCfg.icon} ${bCfg.label}!`, bCfg.color, 1500);
-
-  // Comportamentos especiais
-  if (key === 'ufo') spawnUFO();
-  if (key === 'tsunami') spawnTsunami();
-  if (key === 'giantz') spawnGiantZ();
-
-  G.bonusTimer = setTimeout(() => deactivateBonus(), dur);
+  G.bonusTid=setTimeout(clearBonus,dur);
 }
 
-function deactivateBonus() {
-  G.bonus = null;
-  D.bonusInd.classList.add('hidden');
-  G.zombies.forEach(z => { z.el.className = z.el.className.replace(/bonus-\w+/g, '').trim(); });
-  if (G.ufoCloneTimer) { clearInterval(G.ufoCloneTimer); G.ufoCloneTimer = null; }
-  if (G.ufoEl)     { G.ufoEl.remove();     G.ufoEl     = null; }
-  if (G.tsunamiEl) { G.tsunamiEl.remove(); G.tsunamiEl = null; }
-  D.bonusLayer.innerHTML = '';
+function clearBonus(){
+  if(!G.bonus) return;
+  const prev=G.bonus; G.bonus=null;
+  EL.bonusBar.classList.add('hidden');
+  for(let i=0;i<G.horde.length;i++) G.horde[i].el.classList.remove('bns-'+prev);
+  clearInterval(G.ufoTid); G.ufoTid=null;
+  clearInterval(G.giantTid); G.giantTid=null;
+  if(G.ufoEl){ G.ufoEl.remove(); G.ufoEl=null; }
+  EL.bonVfx.innerHTML='';
+  checkDead(); // se UFO estava mantendo vivo
 }
 
-function spawnUFO() {
-  const el = document.createElement('div');
-  el.className = 'ufo-obj';
-  el.textContent = '🛸';
-  const beam = document.createElement('div');
-  beam.className = 'ufo-beam';
-  el.appendChild(beam);
-  D.bonusLayer.appendChild(el);
-  G.ufoEl = el;
-  // Clona zumbi a cada 3s
-  G.ufoCloneTimer = setInterval(() => {
-    if (!G.running || G.paused || G.bonus !== 'ufo') return;
-    beam.style.height = '120px';
-    setTimeout(() => { beam.style.height = '0'; }, 600);
-    addZombie(1);
-    showToast('🛸 CLONE!', '#00ffff', 700);
-  }, 3000);
+function doUFO(){
+  const wrap=document.createElement('div'); wrap.className='ufo-wrap';
+  wrap.innerHTML='🛸<div class="ufo-beam" id="ufo-beam"></div>';
+  EL.bonVfx.appendChild(wrap); G.ufoEl=wrap;
+  G.ufoTid=setInterval(()=>{
+    if(!G.on||G.paused||G.bonus!=='ufo') return;
+    const beam=document.getElementById('ufo-beam');
+    if(beam){ beam.style.height='110px'; setTimeout(()=>beam.style.height='0',500); }
+    addZombies(1); toast('🛸 CLONE!','#00ffff',600);
+  },3000);
 }
 
-function spawnTsunami() {
-  const el = document.createElement('div');
-  el.className = 'tsunami-wave';
-  el.style.height = '30%';
-  el.innerHTML = '<div class="tsunami-zombies">🧟🧟🧟🌊🌊🌊</div>';
-  D.bonusLayer.appendChild(el);
-  G.tsunamiEl = el;
-  // Tsunami destrói tudo na frente
-  G.worldObjs.forEach(o => {
-    if (!['coin','brain','mystery'].includes(o.type)) {
-      o._hit = true;
-      o.el.remove();
+function doTsunami(){
+  const el=document.createElement('div'); el.className='tsunami';
+  el.style.height='34%'; el.textContent='🧟🌊🧟🌊🧟';
+  EL.bonVfx.appendChild(el);
+  // Limpa obstáculos
+  for(let i=0;i<G.objs.length;i++){
+    const o=G.objs[i];
+    if(!['coin','brain','box'].includes(o.type)){ o.el.remove(); o._rm=true; }
+  }
+  G.objs=G.objs.filter(o=>!o._rm);
+  for(let i=0;i<G.holes.length;i++) G.holes[i].el.remove();
+  G.holes=[];
+}
+
+function doGiantZ(){
+  const el=document.createElement('div');
+  el.style.cssText=`position:absolute;left:${CFG.PLAYER_X-14}px;bottom:${CFG.GROUND_PCT}%;font-size:3rem;z-index:12`;
+  el.textContent='👾';
+  EL.bonVfx.appendChild(el);
+  G.giantTid=setInterval(()=>{
+    if(!G.on||G.paused||G.bonus!=='giantz') return;
+    fx(CFG.PLAYER_X+60,42,'star-fx',6);
+    let best=null,bestD=Infinity;
+    const wx=G.worldX;
+    for(let i=0;i<G.objs.length;i++){
+      const o=G.objs[i];
+      if(['coin','brain'].includes(o.type)) continue;
+      const d=o.wx-wx; if(d>20&&d<bestD){ bestD=d; best=o; }
     }
-  });
-  G.worldObjs = G.worldObjs.filter(o => !o._hit);
-  G.holes.forEach(h => h.el.remove());
-  G.holes = [];
+    if(best){ best.el.remove(); G.objs.splice(G.objs.indexOf(best),1); }
+    if(G.holes.length){ G.holes[0].el.remove(); G.holes.shift(); }
+  },1200);
+  setTimeout(()=>{ EL.bonVfx.innerHTML=''; clearInterval(G.giantTid); },CFG.BONUS.giantz.ms);
 }
 
-function spawnGiantZ() {
-  // Zumbi gigante: substitui todos os zumbis por um elemento grande
-  const el = document.createElement('div');
-  el.className = 'zombie-unit bonus-giantz';
-  el.style.cssText = `left:${C.PLAYER_X_BASE - 20}px;bottom:${(C.GROUND_H * 100)}%`;
-  el.innerHTML = '<div class="z-head" style="width:50px;height:50px;font-size:2rem;display:flex;align-items:center;justify-content:center">👾</div><div class="z-shadow"></div>';
-  D.bonusLayer.appendChild(el);
-  // Laser periódico
-  G._giantLaser = setInterval(() => {
-    if (!G.running || G.paused || G.bonus !== 'giantz') return;
-    spawnFX(C.PLAYER_X_BASE + 60, groundPx() + 30, 'star-fx', 8);
-    // Destrói primeiro obstáculo à frente
-    const front = G.worldObjs.find(o => o.x > C.PLAYER_X_BASE + 30 && !['coin','brain'].includes(o.type));
-    if (front) { front._hit = true; front.el.remove(); G.worldObjs.splice(G.worldObjs.indexOf(front), 1); }
-    const hole = G.holes[0];
-    if (hole) { hole.el.remove(); G.holes.shift(); }
-  }, 1200);
-  setTimeout(() => { clearInterval(G._giantLaser); D.bonusLayer.innerHTML = ''; }, C.BONUSES.giantz.duration);
-}
-
-/* ══════════════════════════════════════════════════
-   PARALAX / CIDADE — cache de prédios para não
-   chamar querySelectorAll() 60x por segundo
-══════════════════════════════════════════════════ */
-let _buildingCache = [];
-
-function buildBuildings() {
-  D.cityLayer.innerHTML = '';
-  _buildingCache = [];
-  const vw = window.innerWidth;
-  const colors = ['#0e0e22','#111128','#0c0c1e','#141430','#0a0a18','#181830'];
-  let x = -40;
-  while (x < vw + 200) {
-    const w = randInt(55,120);
-    const h = randInt(80,260);
-    const bld = document.createElement('div');
-    bld.className = 'bld';
-    bld.style.cssText = `left:${x}px;width:${w}px`;
-    const body = document.createElement('div');
-    body.className = 'bld-body';
-    body.style.cssText = `height:${h}px;--bc:${colors[randInt(0,colors.length-1)]}`;
-    if (Math.random() > 0.5) {
-      const ant = document.createElement('div');
-      ant.className = 'antenna';
-      body.appendChild(ant);
-    }
-    const cols = Math.floor(w/18), rows = Math.floor(h/20);
-    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
-      const win = document.createElement('div');
-      const t = Math.random() < 0.25 ? 'o' : Math.random() < 0.5 ? 'w' : 'c';
-      win.className = `bld-win ${t}`;
-      win.style.cssText = `width:8px;height:7px;left:${8+c*16}px;top:${10+r*18}px`;
-      body.appendChild(win);
-    }
-    bld.appendChild(body);
-    D.cityLayer.appendChild(bld);
-    _buildingCache.push({ el: bld, w });
-    x += w + randInt(8,25);
+/* ════════════════════════════════════════════════
+   EFEITOS VISUAIS
+════════════════════════════════════════════════ */
+function fx(sx,sy,type,n){
+  for(let i=0;i<n;i++){
+    const p=document.createElement('div'); p.className='fx '+type;
+    p.style.cssText=`left:${sx+rnd(-5,5)}px;bottom:${sy}px;
+      --tx:${rnd(-28,8)}px;--ty:${rnd(-32,-4)}px;
+      animation-duration:${rnd(.22,.5).toFixed(2)}s;
+      animation-delay:${(i*.03).toFixed(2)}s`;
+    EL.fxEl.appendChild(p); setTimeout(()=>p.remove(),550);
   }
 }
-
-function updateParallax() {
-  const vw  = window.innerWidth;
-  const spd = G.speed * 0.28;
-  for (let i = 0; i < _buildingCache.length; i++) {
-    const b = _buildingCache[i];
-    const cur = parseFloat(b.el.style.left) || 0;
-    const newX = cur - spd;
-    b.el.style.left = newX + 'px';
-    if (newX + b.w < -60) {
-      b.el.style.left = (vw + randInt(10, 60)) + 'px';
-    }
-  }
+function boom(sx,sy){
+  const p=document.createElement('div'); p.className='boom';
+  p.textContent='💥'; p.style.cssText=`left:${sx}px;bottom:${sy}px;position:absolute`;
+  EL.fxEl.appendChild(p); setTimeout(()=>p.remove(),500);
 }
 
-/* ══════════════════════════════════════════════════
-   FX / PARTÍCULAS
-══════════════════════════════════════════════════ */
-function spawnFX(x, y, type, count) {
-  for (let i = 0; i < count; i++) {
-    const p = document.createElement('div');
-    p.className = 'fx ' + type;
-    const tx = rand(-35, 15), ty = rand(-40, -5);
-    p.style.cssText = `left:${x + rand(-8, 8)}px;bottom:${y}px;
-      --tx:${tx}px;--ty:${ty}px;
-      animation-duration:${rand(.3,.7).toFixed(2)}s;
-      animation-delay:${(i * .04).toFixed(2)}s`;
-    if (type === 'brain-fx') p.textContent = '🧠';
-    D.fxLayer.appendChild(p);
-    setTimeout(() => p.remove(), 800);
-  }
-}
-
-function showExplode(x, y) {
-  const p = document.createElement('div');
-  p.className = 'explode';
-  p.textContent = '💥';
-  p.style.cssText = `left:${x}px;bottom:${y}px;position:absolute`;
-  D.fxLayer.appendChild(p);
-  setTimeout(() => p.remove(), 600);
-}
-
-/* ══════════════════════════════════════════════════
-   SCORE — atualiza HUD só quando o valor muda
-══════════════════════════════════════════════════ */
-let _lastDisplayedScore = -1;
-
-function updateScore() {
-  G.score += C.SCORE_PER_FRAME * G.speed * 0.4;
-  const displayed = Math.floor(G.score);
-  if (displayed !== _lastDisplayedScore) {
-    _lastDisplayedScore = displayed;
-    D.hScore.textContent = displayed;
-  }
-}
-
-/* ══════════════════════════════════════════════════
+/* ════════════════════════════════════════════════
    LOOP PRINCIPAL
-══════════════════════════════════════════════════ */
-function gameLoop(ts) {
-  if (!G.running || G.paused) return;
-  const delta = Math.min(ts - G.lastTs, 50);
-  G.lastTs = ts;
+════════════════════════════════════════════════ */
+const FPS60=1000/60;
+function loop(ts){
+  if(!G.on||G.paused) return;
+  const raw=ts-G.lastTs; G.lastTs=ts;
+  // dt: normalizado para 60fps. Máximo 1.0 para não criar saltos.
+  const dt=clamp(raw/FPS60,0.2,1.0);
 
-  G.speed = clamp(G.speed + C.SPEED_INC, C.SPEED_BASE, C.SPEED_MAX);
+  G.speed=clamp(G.speed+CFG.SPD_INC*dt, CFG.SPD_START, CFG.SPD_MAX);
+  G.score+=G.speed*0.025*dt;
 
-  updateHorde();
-  updateWorldObjects();
-  updateParallax();
-  checkCollisions();
-  updateScore();
+  stepPhysics();        // física vertical: valores fixos (sem dt)
+  stepWorld(dt);        // movimento horizontal: com dt
+  updateParallax(dt);   // paralax: com dt
+  stepCollisions();     // AABB
 
-  G.frameId = requestAnimationFrame(gameLoop);
+  hudScore();
+  G.fid=requestAnimationFrame(loop);
 }
 
-/* ══════════════════════════════════════════════════
-   CONTROLE
-══════════════════════════════════════════════════ */
-function startGame() {
-  // Reset
-  G.running   = false;
-  G.paused    = false;
-  G.score     = 0;
-  G.brains    = 0;
-  G.coinsRun  = 0;
-  G.eaten     = 0;
-  G.speed     = C.SPEED_BASE - (save.upgrades.speed || 0) * 0.3;
-  G.bonus     = null;
-  G.jumping   = false;
-  G.isHolding = false;
-  _lastDisplayedScore = -1;
+/* ════════════════════════════════════════════════
+   CONTROLE DO JOGO
+════════════════════════════════════════════════ */
+function startGame(){
+  cancelAnimationFrame(G.fid);
+  clearTimeout(G.spawnTid); clearTimeout(G.bonusTid);
+  clearInterval(G.ufoTid); clearInterval(G.giantTid);
 
-  // Limpa DOM
-  D.hordeLayer.innerHTML = '';
-  D.worldLayer.innerHTML = '';
-  D.holesLayer.innerHTML = '';
-  D.fxLayer.innerHTML    = '';
-  D.bonusLayer.innerHTML = '';
-  D.bonusInd.classList.add('hidden');
-  G.zombies    = [];
-  G.worldObjs  = [];
-  G.holes      = [];
-  _buildingCache.length > 0 && buildBuildings(); // reconstrói cidade limpa
-  clearTimeout(G.spawnTimer);
-  clearTimeout(G.bonusTimer);
-  clearInterval(G.ufoCloneTimer);
-  clearInterval(G._giantLaser);
+  G.on=false; G.paused=false;
+  G.worldX=0; G.score=0; G.coins=0; G.brains=0; G.eaten=0;
+  G.speed=Math.max(CFG.SPD_START-(S.upg.spd||0)*.3, CFG.SPD_START*.65);
+  G.bonus=null; G.holding=false; G.holdMs=0;
+  _camTx='';
+  if(G.ufoEl){ G.ufoEl.remove(); G.ufoEl=null; }
 
-  // Cria horda inicial
-  const startCount = 1 + (save.upgrades.startZombies || 0);
-  addZombie(startCount);
+  EL.worldEl.innerHTML=''; EL.holesEl.innerHTML='';
+  EL.hordeEl.innerHTML=''; EL.fxEl.innerHTML=''; EL.bonVfx.innerHTML='';
+  EL.worldEl.style.transform=''; EL.holesEl.style.transform='';
+  EL.bonusBar.classList.add('hidden');
+  G.horde=[]; G.objs=[]; G.holes=[];
+  _hH=_hS=_hB=_hC=-1;
+
+  applyCamera();
+  addZombies(1+(S.upg.startZ||0));
 
   showScreen(null);
-  G.running = true;
-  G.lastTs  = performance.now();
-  G.frameId = requestAnimationFrame(gameLoop);
-  scheduleSpawn();
-  updateHUD();
+  G.on=true; G.lastTs=performance.now();
+  G.fid=requestAnimationFrame(loop);
+  scheduleSpawn(CFG.SPAWN_FIRST);
+  hudAll();
 }
 
-function pauseGame() {
-  if (!G.running) return;
-  G.paused = !G.paused;
-  if (G.paused) {
-    cancelAnimationFrame(G.frameId);
-    clearTimeout(G.spawnTimer);
-    showScreen(D.screenPause);
+function pauseGame(){
+  if(!G.on) return;
+  G.paused=!G.paused;
+  if(G.paused){
+    cancelAnimationFrame(G.fid); clearTimeout(G.spawnTid);
+    showScreen(EL.sPause);
   } else {
     showScreen(null);
-    G.lastTs = performance.now();
-    G.frameId = requestAnimationFrame(gameLoop);
+    G.lastTs=performance.now();
+    G.fid=requestAnimationFrame(loop);
     scheduleSpawn();
   }
 }
 
-function triggerGameOver() {
-  G.running = false;
-  cancelAnimationFrame(G.frameId);
-  clearTimeout(G.spawnTimer);
-  clearTimeout(G.bonusTimer);
-  clearInterval(G.ufoCloneTimer);
-  clearInterval(G._giantLaser);
+function gameOver(){
+  G.on=false;
+  cancelAnimationFrame(G.fid);
+  clearTimeout(G.spawnTid); clearTimeout(G.bonusTid);
+  clearInterval(G.ufoTid); clearInterval(G.giantTid);
 
-  const finalScore = Math.floor(G.score);
-  const isNew      = finalScore > save.best;
-  if (isNew) { save.best = finalScore; saveData(); }
+  const sc=Math.floor(G.score);
+  const isNew=sc>S.best;
+  if(isNew){ S.best=sc; writeSave(); }
 
-  $('go-score').textContent  = finalScore;
-  $('go-eaten').textContent  = G.eaten;
-  $('go-brains').textContent = '🧠 ' + G.brains;
-  $('go-coins').textContent  = '💰 ' + G.coinsRun;
-  $('go-best').textContent   = save.best;
-  $('go-new').classList.toggle('hidden', !isNew);
-
-  setTimeout(() => showScreen(D.screenGameover), 500);
+  $('go-score').textContent=sc;
+  $('go-eaten').textContent=G.eaten;
+  $('go-coins').textContent=G.coins;
+  $('go-best').textContent=S.best;
+  $('go-new').classList.toggle('hidden',!isNew);
+  setTimeout(()=>showScreen(EL.sGO),400);
 }
 
-function goToMenu() {
-  G.running = false;
-  G.paused  = false;
-  cancelAnimationFrame(G.frameId);
-  clearTimeout(G.spawnTimer);
-  clearTimeout(G.bonusTimer);
-  clearInterval(G.ufoCloneTimer);
-  clearInterval(G._giantLaser);
-  D.hordeLayer.innerHTML = '';
-  D.worldLayer.innerHTML = '';
-  D.holesLayer.innerHTML = '';
-  D.fxLayer.innerHTML    = '';
-  D.bonusLayer.innerHTML = '';
-  G.zombies = []; G.worldObjs = []; G.holes = [];
-  $('start-best').textContent  = save.best;
-  $('start-coins').textContent = save.coins;
-  showScreen(D.screenStart);
+function goMenu(){
+  G.on=false; G.paused=false;
+  cancelAnimationFrame(G.fid);
+  clearTimeout(G.spawnTid); clearTimeout(G.bonusTid);
+  clearInterval(G.ufoTid); clearInterval(G.giantTid);
+  EL.worldEl.innerHTML=''; EL.holesEl.innerHTML='';
+  EL.hordeEl.innerHTML=''; EL.fxEl.innerHTML=''; EL.bonVfx.innerHTML='';
+  G.horde=[]; G.objs=[]; G.holes=[];
+  $('start-best').textContent=S.best;
+  $('start-coins').textContent=S.coins;
+  showScreen(EL.sStart);
 }
 
-/* ══════════════════════════════════════════════════
-   SHOP
-══════════════════════════════════════════════════ */
-const SHOP_ITEMS = [
-  {
-    id:'startZombies', icon:'🧟', name:'Horda Inicial',
-    desc:'Começa com mais zumbis na horda.',
-    costs:[500,1200,2500], maxLevel:3,
-    effect: lv => `Começa com ${lv+1} zumbi(s)`,
-  },
-  {
-    id:'speed', icon:'🐢', name:'Velocidade',
-    desc:'Reduz a velocidade inicial do jogo.',
-    costs:[400,900], maxLevel:2,
-    effect: lv => `Velocidade inicial -${lv*0.3}`,
-  },
-  {
-    id:'bonusDuration', icon:'⏱', name:'Bonus+',
-    desc:'Aumenta duração dos power-ups em +2s cada.',
-    costs:[600,1400,3000], maxLevel:3,
-    effect: lv => `+${lv*2}s nos power-ups`,
-  },
+/* ════════════════════════════════════════════════
+   LOJA
+════════════════════════════════════════════════ */
+const SHOP=[
+  {id:'startZ', icon:'🧟', name:'Horda Inicial',  desc:'Começa com mais zumbis.',      costs:[500,1200,2500], max:3},
+  {id:'spd',    icon:'🐢', name:'Velocidade',       desc:'Reduz velocidade inicial.',     costs:[400,900],       max:2},
+  {id:'bonMs',  icon:'⏱', name:'Bonus+',            desc:'+2s de duração nos power-ups.', costs:[600,1400,3000], max:3},
 ];
 
-function buildShop() {
-  D.shopGrid.innerHTML = '';
-  $('shop-coins').textContent = save.coins;
-
-  SHOP_ITEMS.forEach(item => {
-    const lvl   = save.upgrades[item.id] || 0;
-    const maxed = lvl >= item.maxLevel;
-    const cost  = maxed ? 0 : item.costs[lvl];
-    const canAfford = save.coins >= cost;
-
-    const el = document.createElement('div');
-    el.className = `shop-item ${maxed ? 'owned' : !canAfford ? 'cant-afford' : ''}`;
-    el.innerHTML = `
-      <div class="si-icon">${item.icon}</div>
+function buildShop(){
+  EL.shopGrid.innerHTML='';
+  $('shop-coins').textContent=S.coins;
+  SHOP.forEach(item=>{
+    const lv=S.upg[item.id]||0, maxed=lv>=item.max;
+    const cost=maxed?0:item.costs[lv], can=S.coins>=cost;
+    const el=document.createElement('div');
+    el.className='si'+(maxed?' owned':!can?' locked':'');
+    el.innerHTML=`<div class="si-icon">${item.icon}</div>
       <div class="si-name">${item.name}</div>
       <div class="si-desc">${item.desc}</div>
-      <div class="si-level">${maxed ? '✅ MÁXIMO' : `Nível ${lvl}/${item.maxLevel}`}</div>
-      <div class="si-price">${maxed ? '—' : `💰 ${cost} moedas`}</div>
-    `;
-    if (!maxed && canAfford) {
-      el.addEventListener('click', () => {
-        save.coins -= cost;
-        save.upgrades[item.id] = lvl + 1;
-        saveData();
-        showToast(`${item.icon} ${item.name} aprimorado!`, '#f5a623', 1500);
-        buildShop();
-        updateHUD();
-      });
-    }
-    D.shopGrid.appendChild(el);
+      <div class="si-lv">${maxed?'✅ MÁXIMO':`Nível ${lv}/${item.max}`}</div>
+      <div class="si-price">${maxed?'—':`💰 ${cost}`}</div>`;
+    if(!maxed&&can) el.addEventListener('click',()=>{
+      S.coins-=cost; S.upg[item.id]=lv+1; writeSave();
+      toast(`${item.icon} Aprimorado!`,'#f5a623',1100); buildShop(); hudCoins();
+    });
+    EL.shopGrid.appendChild(el);
   });
 }
 
-/* ══════════════════════════════════════════════════
+/* ════════════════════════════════════════════════
    EVENTOS
-══════════════════════════════════════════════════ */
-let _holdInterval = null;
-
-document.addEventListener('keydown', e => {
-  if (e.repeat) return;
-  switch (e.code) {
-    case 'Space': case 'ArrowUp': case 'KeyW':
-      e.preventDefault();
-      initiateJump();
-      break;
-    case 'KeyP': case 'Escape':
-      if (G.running) pauseGame();
-      break;
-  }
+════════════════════════════════════════════════ */
+document.addEventListener('keydown',e=>{
+  if(e.repeat) return;
+  if(e.code==='Space'||e.code==='ArrowUp'||e.code==='KeyW'){ e.preventDefault(); jump(); }
+  if((e.code==='KeyP'||e.code==='Escape')&&G.on) pauseGame();
 });
-document.addEventListener('keyup', e => {
-  if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') releaseJump();
+document.addEventListener('keyup',e=>{
+  if(e.code==='Space'||e.code==='ArrowUp'||e.code==='KeyW') releaseJump();
 });
+document.addEventListener('touchstart',e=>{ e.preventDefault(); jump(); },{passive:false});
+document.addEventListener('touchend',  e=>{ e.preventDefault(); releaseJump(); },{passive:false});
+document.addEventListener('mousedown', e=>{ if(e.target.tagName!=='BUTTON'&&!e.target.closest('.card')) jump(); });
+document.addEventListener('mouseup',   releaseJump);
 
-// Touch
-let _touchStart = 0;
-document.addEventListener('touchstart', e => {
-  e.preventDefault();
-  _touchStart = Date.now();
-  initiateJump();
-}, { passive: false });
-document.addEventListener('touchend', e => {
-  e.preventDefault();
-  releaseJump();
-}, { passive: false });
+$('btn-start').addEventListener('click',         startGame);
+$('btn-resume').addEventListener('click',        pauseGame);
+$('btn-restart-pause').addEventListener('click', startGame);
+$('btn-restart').addEventListener('click',       startGame);
+$('btn-menu').addEventListener('click',          goMenu);
+$('btn-pause-hud').addEventListener('click',     pauseGame);
 
-// Mouse hold
-document.addEventListener('mousedown', e => {
-  if (e.target.tagName === 'BUTTON') return;
-  initiateJump();
-});
-document.addEventListener('mouseup', releaseJump);
-
-// Botões
-$('btn-start').addEventListener('click',        startGame);
-$('btn-resume').addEventListener('click',       pauseGame);
-$('btn-restart-pause').addEventListener('click',startGame);
-$('btn-restart').addEventListener('click',      startGame);
-$('btn-menu').addEventListener('click',         goToMenu);
-$('btn-pause-hud').addEventListener('click',    pauseGame);
-
-// Shop
-function openShop() { buildShop(); showScreen(D.screenShop); }
-$('btn-shop-pause').addEventListener('click', () => { G.paused = true; openShop(); });
+function openShop(){ buildShop(); showScreen(EL.sShop); }
+$('btn-shop-pause').addEventListener('click', ()=>{ G.paused=true; openShop(); });
 $('btn-shop-go').addEventListener('click',    openShop);
-$('btn-shop-close').addEventListener('click', () => {
-  if (G.running && G.paused) {
-    showScreen(D.screenPause);
-  } else {
-    showScreen(G.running ? null : D.screenStart);
-  }
+$('btn-shop-close').addEventListener('click', ()=>{
+  if(G.on&&G.paused) showScreen(EL.sPause);
+  else showScreen(G.on?null:EL.sStart);
 });
 
-window.addEventListener('resize', () => {
-  buildBuildings();
-});
+let _rTid=null;
+window.addEventListener('resize',()=>{ clearTimeout(_rTid); _rTid=setTimeout(buildBuildings,200); });
 
-/* ══════════════════════════════════════════════════
+/* ════════════════════════════════════════════════
    INIT
-══════════════════════════════════════════════════ */
-(function init() {
+════════════════════════════════════════════════ */
+(function init(){
   buildScene();
-  $('start-best').textContent  = save.best;
-  $('start-coins').textContent = save.coins;
-  $('h-coins').textContent     = save.coins;
-  showScreen(D.screenStart);
+  $('start-best').textContent=S.best;
+  $('start-coins').textContent=S.coins;
+  EL.hCoins.textContent=S.coins;
+  showScreen(EL.sStart);
 })();
